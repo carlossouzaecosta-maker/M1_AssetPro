@@ -7,6 +7,7 @@ from io import BytesIO
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import os
+import re
 
 try:
     import psycopg2
@@ -60,12 +61,26 @@ def fmt_date(d_val) -> str:
 # ==============================================================================
 DB_NAME = "patrimonio_cpc27.db"
 
+def clean_database_url(url: str) -> str:
+    if not url:
+        return url
+    url = url.strip().strip('"').strip("'")
+    # Remove parâmetro channel_binding caso venha na URL do Neon
+    url = re.sub(r'[?&]channel_binding=[^&]*', '', url)
+    if '?' not in url and '&' in url:
+        url = url.replace('&', '?', 1)
+    if "sslmode=" not in url:
+        sep = '&' if '?' in url else '?'
+        url += f"{sep}sslmode=require"
+    return url
+
 def get_db_url():
+    raw_url = None
     if "DATABASE_URL" in st.secrets:
-        return st.secrets["DATABASE_URL"]
-    if "DATABASE_URL" in os.environ:
-        return os.environ["DATABASE_URL"]
-    return None
+        raw_url = st.secrets["DATABASE_URL"]
+    elif "DATABASE_URL" in os.environ:
+        raw_url = os.environ["DATABASE_URL"]
+    return clean_database_url(raw_url) if raw_url else None
 
 IS_POSTGRES = bool(get_db_url() and HAS_PSYCOPG2)
 
@@ -116,8 +131,12 @@ class DBCursorWrapper:
 def get_connection():
     db_url = get_db_url()
     if db_url and HAS_PSYCOPG2:
-        conn = psycopg2.connect(db_url)
-        return DBConnectionWrapper(conn, is_pg=True)
+        try:
+            conn = psycopg2.connect(db_url)
+            return DBConnectionWrapper(conn, is_pg=True)
+        except Exception as e:
+            st.error(f"Erro ao conectar com PostgreSQL (Neon): {e}")
+            raise e
     else:
         conn = sqlite3.connect(DB_NAME)
         conn.execute("PRAGMA foreign_keys = ON;")
