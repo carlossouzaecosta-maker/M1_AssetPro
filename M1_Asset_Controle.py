@@ -6,9 +6,17 @@ from datetime import datetime, date, timedelta
 from io import BytesIO
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+import os
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
 
 # ==============================================================================
-# CONFIGURAÇÃO DE TELA E RESILIÊNCIA STREAMLIT
+# CONFIGURAÇÃO DE ECRÃ E RESILIÊNCIA STREAMLIT
 # ==============================================================================
 st.set_page_config(
     layout="wide",
@@ -48,14 +56,72 @@ def fmt_date(d_val) -> str:
         return d_str
 
 # ==============================================================================
-# BANCO DE DADOS (SQLITE)
+# GESTÃO DE CONEXÃO MULTI-BASE DE DADOS (POSTGRESQL OU SQLITE)
 # ==============================================================================
 DB_NAME = "patrimonio_cpc27.db"
 
+def get_db_url():
+    if "DATABASE_URL" in st.secrets:
+        return st.secrets["DATABASE_URL"]
+    if "DATABASE_URL" in os.environ:
+        return os.environ["DATABASE_URL"]
+    return None
+
+IS_POSTGRES = bool(get_db_url() and HAS_PSYCOPG2)
+
+class DBConnectionWrapper:
+    def __init__(self, conn, is_pg=False):
+        self.conn = conn
+        self.is_pg = is_pg
+
+    def cursor(self):
+        return DBCursorWrapper(self.conn.cursor(), self.is_pg)
+
+    def commit(self):
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+class DBCursorWrapper:
+    def __init__(self, cursor, is_pg=False):
+        self.cursor = cursor
+        self.is_pg = is_pg
+
+    def execute(self, sql, params=None):
+        if self.is_pg:
+            sql_pg = sql.replace("?", "%s")
+            if params is None:
+                return self.cursor.execute(sql_pg)
+            return self.cursor.execute(sql_pg, params)
+        else:
+            if params is None:
+                return self.cursor.execute(sql)
+            return self.cursor.execute(sql, params)
+
+    def fetchone(self):
+        return self.cursor.fetchone()
+
+    def fetchall(self):
+        return self.cursor.fetchall()
+
+    @property
+    def lastrowid(self):
+        return getattr(self.cursor, "lastrowid", None)
+
+    @property
+    def rowcount(self):
+        return self.cursor.rowcount
+
 def get_connection():
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+    db_url = get_db_url()
+    if db_url and HAS_PSYCOPG2:
+        conn = psycopg2.connect(db_url)
+        return DBConnectionWrapper(conn, is_pg=True)
+    else:
+        conn = sqlite3.connect(DB_NAME)
+        conn.execute("PRAGMA foreign_keys = ON;")
+        return DBConnectionWrapper(conn, is_pg=False)
 
 def log_audit(conn, company_id, user_email, action, entity, details):
     cur = conn.cursor()
@@ -68,25 +134,32 @@ def init_db():
     conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute("""
+    if IS_POSTGRES:
+        id_serial = "SERIAL PRIMARY KEY"
+        auto_dt = "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+    else:
+        id_serial = "INTEGER PRIMARY KEY AUTOINCREMENT"
+        auto_dt = "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+
+    cur.execute(f"""
     CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id {id_serial},
         email TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
         user_type TEXT NOT NULL CHECK(user_type IN ('ADMIN', 'EXTERNO')),
         must_reset_password INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at {auto_dt}
     );
     """)
 
-    cur.execute("""
+    cur.execute(f"""
     CREATE TABLE IF NOT EXISTS companies (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id {id_serial},
         code TEXT UNIQUE NOT NULL,
         name TEXT NOT NULL,
         cnpj TEXT NOT NULL,
         depreciation_method TEXT NOT NULL CHECK(depreciation_method IN ('MENSAL', 'DIARIO')),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at {auto_dt}
     );
     """)
 
@@ -100,18 +173,18 @@ def init_db():
     );
     """)
 
-    cur.execute("""
+    cur.execute(f"""
     CREATE TABLE IF NOT EXISTS asset_classes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id {id_serial},
         name TEXT UNIQUE NOT NULL,
         useful_life_years REAL NOT NULL,
         fiscal_life_years REAL NOT NULL
     );
     """)
 
-    cur.execute("""
+    cur.execute(f"""
     CREATE TABLE IF NOT EXISTS asset_subclasses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id {id_serial},
         class_id INTEGER NOT NULL,
         name TEXT NOT NULL,
         useful_life_years REAL,
@@ -121,9 +194,9 @@ def init_db():
     );
     """)
 
-    cur.execute("""
+    cur.execute(f"""
     CREATE TABLE IF NOT EXISTS chart_of_accounts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id {id_serial},
         company_id INTEGER NOT NULL,
         class_id INTEGER,
         account_code TEXT NOT NULL,
@@ -134,9 +207,9 @@ def init_db():
     );
     """)
 
-    cur.execute("""
+    cur.execute(f"""
     CREATE TABLE IF NOT EXISTS assets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id {id_serial},
         company_id INTEGER NOT NULL,
         tag_number TEXT NOT NULL,
         description TEXT NOT NULL,
@@ -159,7 +232,7 @@ def init_db():
         initial_accum_depr REAL DEFAULT 0.0,
         initial_monthly_depr REAL DEFAULT 0.0,
         initial_base_date DATE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at {auto_dt},
         FOREIGN KEY (company_id) REFERENCES companies(id),
         FOREIGN KEY (class_id) REFERENCES asset_classes(id),
         FOREIGN KEY (subclass_id) REFERENCES asset_subclasses(id),
@@ -167,38 +240,23 @@ def init_db():
     );
     """)
 
-    # Migração defensiva: assegura colunas da base inicial
-    cur.execute("PRAGMA table_info(assets);")
-    existing_cols = [c[1] for c in cur.fetchall()]
-    new_cols = {
-        "brand": "TEXT", "model": "TEXT", "serial_number": "TEXT",
-        "year_manufacture": "INTEGER", "location": "TEXT", "cost_center": "TEXT",
-        "conservation_state": "TEXT DEFAULT 'Bom'",
-        "initial_accum_depr": "REAL DEFAULT 0.0",
-        "initial_monthly_depr": "REAL DEFAULT 0.0",
-        "initial_base_date": "DATE"
-    }
-    for col_name, col_type in new_cols.items():
-        if col_name not in existing_cols:
-            cur.execute(f"ALTER TABLE assets ADD COLUMN {col_name} {col_type};")
-
-    cur.execute("""
+    cur.execute(f"""
     CREATE TABLE IF NOT EXISTS life_revaluations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id {id_serial},
         company_id INTEGER NOT NULL,
         target_type TEXT NOT NULL CHECK(target_type IN ('CLASSE', 'SUBCLASSE', 'ATIVO')),
         target_id INTEGER NOT NULL,
         cut_off_date DATE NOT NULL,
         new_useful_life_years REAL NOT NULL,
         report_reference TEXT,
-        applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        applied_at {auto_dt},
         FOREIGN KEY (company_id) REFERENCES companies(id)
     );
     """)
 
-    cur.execute("""
+    cur.execute(f"""
     CREATE TABLE IF NOT EXISTS asset_disposals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id {id_serial},
         asset_id INTEGER NOT NULL,
         disposal_date DATE NOT NULL,
         disposal_type TEXT NOT NULL,
@@ -206,20 +264,20 @@ def init_db():
         cost_disposed REAL NOT NULL,
         depr_accum_disposed REAL NOT NULL,
         gain_loss_value REAL NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at {auto_dt},
         FOREIGN KEY (asset_id) REFERENCES assets(id)
     );
     """)
 
-    cur.execute("""
+    cur.execute(f"""
     CREATE TABLE IF NOT EXISTS audit_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id {id_serial},
         company_id INTEGER,
         user_email TEXT NOT NULL,
         action TEXT NOT NULL,
         entity TEXT NOT NULL,
         details TEXT NOT NULL,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        timestamp {auto_dt}
     );
     """)
 
@@ -318,11 +376,11 @@ def login_screen():
                 }
                 st.rerun()
             else:
-                st.error("Credenciais inválidas. Verifique seus dados.")
+                st.error("Credenciais inválidas. Verifique os seus dados.")
 
 def reset_password_screen():
     st.subheader("Redefinição de Senha")
-    st.info("Cadastre uma nova senha pessoal para prosseguir.")
+    st.info("Registe uma nova senha pessoal para prosseguir.")
     new_pw = st.text_input("Nova Senha", type="password")
     conf_pw = st.text_input("Confirmar Nova Senha", type="password")
 
@@ -331,7 +389,7 @@ def reset_password_screen():
             st.error("A senha deve ter no mínimo 6 dígitos.")
             return
         if new_pw != conf_pw:
-            st.error("Senhas não coincidem.")
+            st.error("As senhas não coincidem.")
             return
 
         conn = get_connection()
@@ -343,7 +401,7 @@ def reset_password_screen():
         conn.commit()
         conn.close()
         st.session_state.logged_user["must_reset_password"] = False
-        st.success("Senha atualizada!")
+        st.success("Senha atualizada com sucesso!")
         st.rerun()
 
 if not st.session_state.logged_user:
@@ -389,6 +447,8 @@ DEPR_METHOD = active_company[3]
 
 st.sidebar.markdown(f"**Operador:** `{st.session_state.logged_user['email']}`")
 st.sidebar.markdown(f"**Perfil:** `{st.session_state.logged_user['user_type']}`")
+st.sidebar.caption("Armazenamento: **Nuvem PostgreSQL (Neon)**" if IS_POSTGRES else "Armazenamento: **SQLite Local**")
+
 if st.sidebar.button("Encerrar Sessão", use_container_width=True):
     st.session_state.logged_user = None
     st.rerun()
@@ -420,16 +480,21 @@ def calculate_asset_depreciation_to_date(asset_row, target_date: date, revaluati
     if base_depr <= 0:
         return 0.0, total_cost
 
-    # 1. Regra para Base Inicial Histórica (Depreciação mensal informada)
-    has_initial_base = bool(asset_row.get('initial_base_date') and float(asset_row.get('initial_monthly_depr') or 0.0) > 0)
+    # 1. Regra para Base Inicial Histórica: qualquer item que tenha initial_base_date registrado
+    has_initial_base = bool(asset_row.get('initial_base_date'))
     
     if calculation_type == 'SOCIETARIO' and has_initial_base:
         init_base_dt = date_from_str(asset_row['initial_base_date'])
         init_accum = float(asset_row.get('initial_accum_depr') or 0.0)
         monthly_quota = float(asset_row.get('initial_monthly_depr') or 0.0)
 
-        # Se a data alvo for anterior ou igual à data base inicial
+        # Se a data alvo for anterior ou igual à data base inicial, preserva o saldo acumulado original
         if target_date <= init_base_dt:
+            accum = min(base_depr, init_accum)
+            return round(accum, 2), round(total_cost - accum, 2)
+
+        # Se o item já estava 100% depreciado na data base (ou a cota mensal é 0), estabiliza no saldo inicial
+        if init_accum >= base_depr or monthly_quota <= 0:
             accum = min(base_depr, init_accum)
             return round(accum, 2), round(total_cost - accum, 2)
 
@@ -456,7 +521,7 @@ def calculate_asset_depreciation_to_date(asset_row, target_date: date, revaluati
             accum = min(base_depr, accum)
             return round(accum, 2), round(total_cost - accum, 2)
 
-    # 2. Regra Linear Padrão (Societário e Fiscal / Pós-Reavaliações)
+    # 2. Regra Linear Padrão (Societário novo ou Fiscal)
     start_date = date_from_str(asset_row['start_date'])
     if DEPR_METHOD == 'MENSAL':
         first_of_next_m = (start_date.replace(day=28) + timedelta(days=4)).replace(day=1)
@@ -472,7 +537,6 @@ def calculate_asset_depreciation_to_date(asset_row, target_date: date, revaluati
     else:
         base_life_years = float(asset_row.get('subclass_fiscal_life') or asset_row.get('class_fiscal_life') or 10.0)
 
-    # Reavaliações societárias prospectivas
     applicable_revals = []
     if calculation_type == 'SOCIETARIO':
         for r in revaluations_list:
@@ -507,7 +571,6 @@ def calculate_asset_depreciation_to_date(asset_row, target_date: date, revaluati
 
         return round(accum, 2), round(total_cost - accum, 2)
 
-    # Cálculo encadeado por laudos
     curr_date = comp_start_date
     accum_depr = 0.0
     current_life_years = base_life_years
@@ -595,7 +658,7 @@ menu = st.sidebar.radio(
 )
 
 # ------------------------------------------------------------------------------
-# 1. PAINEL GERAL & EXTRATO ANALÍTICO MENSALIZADO
+# 1. PAINEL GERAL & EXTRATO ANALÍTICO (MENSALIZADO)
 # ------------------------------------------------------------------------------
 if menu == "Painel Geral & Extrato":
     st.title("📊 Painel Geral de Ativos Imobilizados")
@@ -613,13 +676,28 @@ if menu == "Painel Geral & Extrato":
         FROM assets a
         INNER JOIN asset_classes c ON c.id = a.class_id
         LEFT JOIN asset_subclasses s ON s.id = a.subclass_id
+        WHERE a.company_id = %s
+    """ if IS_POSTGRES else """
+        SELECT a.id, a.tag_number, a.description, a.status, a.acquisition_date, a.start_date,
+               a.acquisition_cost, a.additional_costs, a.residual_value,
+               a.brand, a.model, a.serial_number, a.year_manufacture, a.location, a.cost_center, a.conservation_state,
+               a.initial_accum_depr, a.initial_monthly_depr, a.initial_base_date,
+               c.name as class_name, c.useful_life_years as class_useful_life, c.fiscal_life_years as class_fiscal_life,
+               s.name as subclass_name, s.useful_life_years as subclass_useful_life, s.fiscal_life_years as subclass_fiscal_life,
+               a.class_id, a.subclass_id
+        FROM assets a
+        INNER JOIN asset_classes c ON c.id = a.class_id
+        LEFT JOIN asset_subclasses s ON s.id = a.subclass_id
         WHERE a.company_id = ?
-    """, conn, params=(ACTIVE_COMPANY_ID,))
+    """, conn.conn, params=(ACTIVE_COMPANY_ID,))
 
     revals = pd.read_sql_query("""
         SELECT target_type, target_id, cut_off_date, new_useful_life_years
+        FROM life_revaluations WHERE company_id = %s
+    """ if IS_POSTGRES else """
+        SELECT target_type, target_id, cut_off_date, new_useful_life_years
         FROM life_revaluations WHERE company_id = ?
-    """, conn, params=(ACTIVE_COMPANY_ID,)).to_dict('records')
+    """, conn.conn, params=(ACTIVE_COMPANY_ID,)).to_dict('records')
     conn.close()
 
     if assets_df.empty:
@@ -642,10 +720,7 @@ if menu == "Painel Geral & Extrato":
         for _, row in assets_df.iterrows():
             custo_total = float(row['acquisition_cost'] or 0.0) + float(row['additional_costs'] or 0.0)
             
-            # Depreciação no fechamento do ano anterior (Saldo Inicial do ano)
             depr_ini_ano, _ = calculate_asset_depreciation_to_date(row, dt_ano_ant, revals, 'SOCIETARIO')
-            
-            # Depreciação acumulada até a data-base de posição
             depr_soc_acum, vlc = calculate_asset_depreciation_to_date(row, ref_date, revals, 'SOCIETARIO')
             depr_fisc_acum, _ = calculate_asset_depreciation_to_date(row, ref_date, revals, 'FISCAL')
 
@@ -672,17 +747,16 @@ if menu == "Painel Geral & Extrato":
                 "Depr. Acumulada Societária Inicial": fmt_brl(depr_ini_ano)
             }
 
-            # Cálculo de quota para cada mês de Janeiro a Dezembro
             acum_mes_anterior = depr_ini_ano
             for nome_m, num_m in meses_nomes:
                 fim_mes = get_last_day_of_month(date(ref_year, num_m, 1))
                 if ref_date >= fim_mes:
                     depr_fim_m, _ = calculate_asset_depreciation_to_date(row, fim_mes, revals, 'SOCIETARIO')
-                    quota_mes = max(0.0, depr_fim_m - acum_mes_anterior)
+                    quota_mes = max(0.0, round(depr_fim_m - acum_mes_anterior, 2))
                     acum_mes_anterior = depr_fim_m
                 elif ref_date.month == num_m and ref_date.year == ref_year:
                     depr_fim_m, _ = calculate_asset_depreciation_to_date(row, ref_date, revals, 'SOCIETARIO')
-                    quota_mes = max(0.0, depr_fim_m - acum_mes_anterior)
+                    quota_mes = max(0.0, round(depr_fim_m - acum_mes_anterior, 2))
                     acum_mes_anterior = depr_fim_m
                 else:
                     quota_mes = 0.0
@@ -697,10 +771,9 @@ if menu == "Painel Geral & Extrato":
 
         df_rep = pd.DataFrame(results_display)
 
-        # Cards Executivos
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total de Ativos", len(df_rep))
-        c1.caption(f"Ativos Operacionais: {len(df_rep[df_rep['Status'] == 'ATIVO'])} | Baixados: {len(df_rep[df_rep['Status'] == 'BAIXADO'])}")
+        c1.caption(f"Ativos Ativos: {len(df_rep[df_rep['Status'] == 'ATIVO'])} | Baixados: {len(df_rep[df_rep['Status'] == 'BAIXADO'])}")
         c2.metric("Custo Imobilizado Total", f"R$ {fmt_brl(tot_custo_num)}")
         c3.metric("Depr. Acumulada (Societária)", f"R$ {fmt_brl(tot_depr_num)}")
         c4.metric("Valor Contábil Líquido (VLC)", f"R$ {fmt_brl(tot_vlc_num)}")
@@ -751,9 +824,9 @@ elif menu == "Cadastro de Ativos (Adições & Lote)":
     with aba_base_ini:
         st.subheader("📥 Carga da Base Inicial Histórica do Cliente")
         st.markdown("""
-        Esta etapa permite importar a **base histórica completa** respeitando a **`Depreciação Acumulada`** e a **`Depreciação Mensal`** já apurada em laudos ou controles anteriores do cliente.
-        - O sistema manterá a **Depreciação Mensal informada** ao longo do tempo até que o bem atinja a depreciação total do seu custo.
-        - **Trava de Segurança:** A depreciação acumulada é limitada rigorosamente ao custo total menos o valor residual.
+        Importe a base histórica completa respeitando a **`Depreciação Acumulada`** e a **`Depreciação Mensal`** já calculadas nos laudos anteriores do cliente.
+        - O sistema mantém a **Depreciação Mensal** informada até à depreciação total do custo.
+        - **Trava de Segurança:** A depreciação acumulada nunca ultrapassa o custo total menos o valor residual.
         """)
 
         cols_base_ini = [
@@ -776,7 +849,7 @@ elif menu == "Cadastro de Ativos (Adições & Lote)":
         col_b_ini1, col_b_ini2 = st.columns([1, 1])
         with col_b_ini1:
             st.download_button(
-                "📄 Baixar Template Modelo da Base Inicial (.xlsx)",
+                "📄 Baixar Template da Base Inicial (.xlsx)",
                 data=generate_template_excel(cols_base_ini, [sample_base_ini]),
                 file_name="template_base_inicial_ativos.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -784,7 +857,7 @@ elif menu == "Cadastro de Ativos (Adições & Lote)":
         with col_b_ini2:
             data_corte_base = st.date_input("Data-Base de Referência do Saldo Inicial", value=date(2025, 12, 31))
 
-        up_file_ini = st.file_uploader("Arquivo da Base Inicial Histórica (.xlsx)", type=["xlsx"], key="up_base_ini_file")
+        up_file_ini = st.file_uploader("Ficheiro da Base Inicial Histórica (.xlsx)", type=["xlsx"], key="up_base_ini_file")
         if up_file_ini:
             try:
                 df_ini = pd.read_excel(up_file_ini)
@@ -812,7 +885,6 @@ elif menu == "Cadastro de Ativos (Adições & Lote)":
                         custo = float(row.get("CustoAquisicao", 0))
                         custo_add = float(row.get("CustosAdicionais", 0)) if pd.notna(row.get("CustosAdicionais")) else 0.0
                         
-                        # Tratamento do valor residual (não confunde com saldo contábil líquido)
                         res_val_raw = float(row.get("ValorResidual", 0)) if pd.notna(row.get("ValorResidual")) else 0.0
                         if custo > 0 and res_val_raw >= custo * 0.99:
                             res_val = 0.0
@@ -834,7 +906,6 @@ elif menu == "Cadastro de Ativos (Adições & Lote)":
                         if est_cons not in CONSERVATION_OPTIONS:
                             est_cons = "Bom"
 
-                        # Garantir Classe
                         if classe_nome not in class_map:
                             cur.execute("""
                                 INSERT INTO asset_classes (name, useful_life_years, fiscal_life_years)
@@ -847,7 +918,6 @@ elif menu == "Cadastro de Ativos (Adições & Lote)":
                         else:
                             c_id = class_map[classe_nome]
 
-                        # Garantir Subclasse se informada
                         s_id = None
                         if subclasse_nome:
                             cur.execute("""
@@ -858,7 +928,6 @@ elif menu == "Cadastro de Ativos (Adições & Lote)":
                             cur.execute("SELECT id FROM asset_subclasses WHERE class_id = ? AND name = ?", (c_id, subclasse_nome))
                             s_id = cur.fetchone()[0]
 
-                        # Inserir ou atualizar com saldos históricos da base inicial
                         cur.execute("SELECT id FROM assets WHERE company_id = ? AND tag_number = ?", (ACTIVE_COMPANY_ID, tag))
                         exists = cur.fetchone()
                         if exists:
@@ -901,17 +970,17 @@ elif menu == "Cadastro de Ativos (Adições & Lote)":
                         f"Data Base: {data_corte_base} | Inseridos: {imported_count} | Atualizados: {updated_count}"
                     )
                     conn.commit()
-                    st.success(f"Base Inicial Histórica processada com sucesso! Inseridos: {imported_count} | Atualizados: {updated_count}")
+                    st.success(f"Base Inicial Histórica processada! Inseridos: {imported_count} | Atualizados: {updated_count}")
                     if errors:
                         st.warning("Erros encontrados:\n" + "\n".join(errors[:10]))
                     st.rerun()
             except Exception as e:
-                st.error(f"Erro ao processar planilha de base inicial: {e}")
+                st.error(f"Erro ao processar ficheiro de base inicial: {e}")
 
     # --- ABA 2: UPLOAD DE ADIÇÕES / LOTES ROTINEIROS ---
     with aba_lote_adicoes:
         st.subheader("Carga em Lote de Novas Adições")
-        st.markdown("Utilize esta aba para subir lotes periódicos de aquisições de ativos.")
+        st.markdown("Suba ficheiros de aquisições periódicas normais.")
         cols_template_adicoes = [
             "Plaqueta", "Descricao", "Classe", "Subclasse", "DataAquisicao",
             "DataInicio", "CustoAquisicao", "CustosAdicionais", "ValorResidual", "ChaveNFe",
@@ -933,7 +1002,7 @@ elif menu == "Cadastro de Ativos (Adições & Lote)":
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        up_adic_file = st.file_uploader("Arquivo de Novas Adições (.xlsx)", type=["xlsx"], key="up_adic_file")
+        up_adic_file = st.file_uploader("Ficheiro de Novas Adições (.xlsx)", type=["xlsx"], key="up_adic_file")
         if up_adic_file:
             try:
                 df_adic = pd.read_excel(up_adic_file)
@@ -1181,7 +1250,7 @@ elif menu == "Cadastro de Ativos (Adições & Lote)":
             has_disposal = cur.fetchone()[0] > 0
 
             if has_disposal:
-                st.warning("Este ativo possui registro de baixa contábil vinculado e não pode ser excluído diretamente. Reverta a baixa antes se necessário.")
+                st.warning("Este ativo possui registo de baixa contábil vinculado e não pode ser excluído diretamente.")
             else:
                 conf = st.checkbox(f"Confirmo a exclusão definitiva do ativo: {sel_del}")
                 if st.button("Excluir Registro Definitivamente", type="primary") and conf:
@@ -1199,7 +1268,7 @@ elif menu == "Cadastro de Ativos (Adições & Lote)":
 elif menu == "Reavaliação de Vida Útil":
     st.title("🔄 Reavaliação Prospectiva de Vida Útil (CPC 27)")
     st.markdown("""
-    Registro de revisões técnicas de vida útil com vigência prospectiva.
+    Registo de revisões técnicas de vida útil com vigência prospectiva.
     * **Trava dos 12 meses:** Se o prazo restante recalculado for menor que 12 meses, o saldo remanescente será depreciado em 12 meses lineares.
     """)
 
@@ -1271,8 +1340,13 @@ elif menu == "Reavaliação de Vida Útil":
         SELECT id, target_type as "Abrangência", target_id as "ID Alvo",
                cut_off_date as "Data Corte", new_useful_life_years as "Nova Vida Útil (Anos)",
                report_reference as "Laudo", applied_at as "Registrado em"
-        FROM life_revaluations WHERE company_id = ? ORDER BY cut_off_date DESC
-    """, conn, params=(ACTIVE_COMPANY_ID,))
+        FROM life_revaluations WHERE company_id = %s
+    """ if IS_POSTGRES else """
+        SELECT id, target_type as "Abrangência", target_id as "ID Alvo",
+               cut_off_date as "Data Corte", new_useful_life_years as "Nova Vida Útil (Anos)",
+               report_reference as "Laudo", applied_at as "Registrado em"
+        FROM life_revaluations WHERE company_id = ?
+    """, conn.conn, params=(ACTIVE_COMPANY_ID,))
     if not reval_df.empty:
         reval_df["Data Corte"] = reval_df["Data Corte"].apply(fmt_date)
     render_table(reval_df)
@@ -1389,11 +1463,11 @@ elif menu == "Baixas de Ativos & Reversão":
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        up_baixas = st.file_uploader("Arquivo de Baixas em Lote (.xlsx)", type=["xlsx"], key="up_baixas_file")
+        up_baixas = st.file_uploader("Ficheiro de Baixas em Lote (.xlsx)", type=["xlsx"], key="up_baixas_file")
         if up_baixas:
             try:
                 df_b_upload = pd.read_excel(up_baixas)
-                st.write("Pré-visualização do arquivo de baixas:")
+                st.write("Pré-visualização do ficheiro de baixas:")
                 st.dataframe(df_b_upload.head(10), use_container_width=True)
 
                 if st.button("Executar Baixas em Lote", type="primary"):
@@ -1463,7 +1537,7 @@ elif menu == "Baixas de Ativos & Reversão":
                         st.warning("Itens não processados:\n" + "\n".join(nao_encontrados[:10]))
                     st.rerun()
             except Exception as e:
-                st.error(f"Erro ao processar arquivo de baixas: {e}")
+                st.error(f"Erro ao processar ficheiro de baixas: {e}")
 
     # --- ABA REVERSÃO DE BAIXAS ---
     with aba_reversao:
@@ -1487,7 +1561,7 @@ elif menu == "Baixas de Ativos & Reversão":
                 f"Baixa #{b[0]} | Plaqueta: {b[2]} - {b[3]} | Data: {fmt_date(b[1])} | Custo: R$ {fmt_brl(b[5])}": b
                 for b in baixas_feitas
             }
-            sel_rev = st.selectbox("Selecione o registro de baixa a ser revertido", list(dict_reverso.keys()))
+            sel_rev = st.selectbox("Selecione o registo de baixa a reverter", list(dict_reverso.keys()))
             b_info = dict_reverso[sel_rev]
 
             motivo_reversao = st.text_input("Justificativa da Reversão (Obrigatório para Auditoria) *")
@@ -1519,9 +1593,15 @@ elif menu == "Baixas de Ativos & Reversão":
                d.depr_accum_disposed as "Depr. Acumulada", d.gain_loss_value as "Resultado (Ganho/Perda)"
         FROM asset_disposals d
         INNER JOIN assets a ON a.id = d.asset_id
+        WHERE a.company_id = %s
+    """ if IS_POSTGRES else """
+        SELECT d.id as "ID Baixa", d.disposal_date as "Data Baixa", a.tag_number as "Plaqueta", a.description as "Ativo",
+               d.disposal_type as "Tipo", d.sale_value as "Valor Venda", d.cost_disposed as "Custo Baixado",
+               d.depr_accum_disposed as "Depr. Acumulada", d.gain_loss_value as "Resultado (Ganho/Perda)"
+        FROM asset_disposals d
+        INNER JOIN assets a ON a.id = d.asset_id
         WHERE a.company_id = ?
-        ORDER BY d.disposal_date DESC
-    """, conn, params=(ACTIVE_COMPANY_ID,))
+    """, conn.conn, params=(ACTIVE_COMPANY_ID,))
     if not baixas_df.empty:
         baixas_df["Data Baixa"] = baixas_df["Data Baixa"].apply(fmt_date)
         for c in ["Valor Venda", "Custo Baixado", "Depr. Acumulada", "Resultado (Ganho/Perda)"]:
@@ -1557,13 +1637,27 @@ elif menu == "Módulo Fiscal (LALUR/LACS)":
         FROM assets a
         INNER JOIN asset_classes c ON c.id = a.class_id
         LEFT JOIN asset_subclasses s ON s.id = a.subclass_id
+        WHERE a.company_id = %s
+    """ if IS_POSTGRES else """
+        SELECT a.id, a.tag_number, a.description, a.acquisition_date, a.start_date,
+               a.acquisition_cost, a.additional_costs, a.residual_value,
+               a.initial_accum_depr, a.initial_monthly_depr, a.initial_base_date,
+               c.name as class_name, c.useful_life_years as class_useful_life, c.fiscal_life_years as class_fiscal_life,
+               s.name as subclass_name, s.useful_life_years as subclass_useful_life, s.fiscal_life_years as subclass_fiscal_life,
+               a.class_id, a.subclass_id
+        FROM assets a
+        INNER JOIN asset_classes c ON c.id = a.class_id
+        LEFT JOIN asset_subclasses s ON s.id = a.subclass_id
         WHERE a.company_id = ?
-    """, conn, params=(ACTIVE_COMPANY_ID,))
+    """, conn.conn, params=(ACTIVE_COMPANY_ID,))
 
     revals = pd.read_sql_query("""
         SELECT target_type, target_id, cut_off_date, new_useful_life_years
+        FROM life_revaluations WHERE company_id = %s
+    """ if IS_POSTGRES else """
+        SELECT target_type, target_id, cut_off_date, new_useful_life_years
         FROM life_revaluations WHERE company_id = ?
-    """, conn, params=(ACTIVE_COMPANY_ID,)).to_dict('records')
+    """, conn.conn, params=(ACTIVE_COMPANY_ID,)).to_dict('records')
     conn.close()
 
     lalur_data = []
@@ -1687,13 +1781,27 @@ elif menu == "Partidas Dobradas (ERP-Ready)":
         FROM assets a
         INNER JOIN asset_classes c ON c.id = a.class_id
         LEFT JOIN asset_subclasses s ON s.id = a.subclass_id
+        WHERE a.company_id = %s
+    """ if IS_POSTGRES else """
+        SELECT a.id, a.tag_number, a.description, a.acquisition_date, a.start_date,
+               a.acquisition_cost, a.additional_costs, a.residual_value,
+               a.initial_accum_depr, a.initial_monthly_depr, a.initial_base_date,
+               c.name as class_name, c.useful_life_years as class_useful_life, c.fiscal_life_years as class_fiscal_life,
+               s.name as subclass_name, s.useful_life_years as subclass_useful_life, s.fiscal_life_years as subclass_fiscal_life,
+               a.class_id, a.subclass_id
+        FROM assets a
+        INNER JOIN asset_classes c ON c.id = a.class_id
+        LEFT JOIN asset_subclasses s ON s.id = a.subclass_id
         WHERE a.company_id = ?
-    """, conn, params=(ACTIVE_COMPANY_ID,))
+    """, conn.conn, params=(ACTIVE_COMPANY_ID,))
 
     revals = pd.read_sql_query("""
         SELECT target_type, target_id, cut_off_date, new_useful_life_years
+        FROM life_revaluations WHERE company_id = %s
+    """ if IS_POSTGRES else """
+        SELECT target_type, target_id, cut_off_date, new_useful_life_years
         FROM life_revaluations WHERE company_id = ?
-    """, conn, params=(ACTIVE_COMPANY_ID,)).to_dict('records')
+    """, conn.conn, params=(ACTIVE_COMPANY_ID,)).to_dict('records')
 
     depr_por_classe = {}
     for _, row in assets_df.iterrows():
@@ -1783,10 +1891,16 @@ elif menu == "Quadro de Movimentação":
         d_fechamento = st.date_input("Data de Fechamento", value=date(ano_corrente, 12, 31))
 
     conn = get_connection()
-    classes = pd.read_sql_query("SELECT id, name FROM asset_classes", conn)
+    classes = pd.read_sql_query("SELECT id, name FROM asset_classes", conn.conn)
 
     quadro = []
-    revals = pd.read_sql_query("SELECT target_type, target_id, cut_off_date, new_useful_life_years FROM life_revaluations WHERE company_id = ?", conn, params=(ACTIVE_COMPANY_ID,)).to_dict('records')
+    revals = pd.read_sql_query("""
+        SELECT target_type, target_id, cut_off_date, new_useful_life_years
+        FROM life_revaluations WHERE company_id = %s
+    """ if IS_POSTGRES else """
+        SELECT target_type, target_id, cut_off_date, new_useful_life_years
+        FROM life_revaluations WHERE company_id = ?
+    """, conn.conn, params=(ACTIVE_COMPANY_ID,)).to_dict('records')
 
     for _, c_row in classes.iterrows():
         c_id = c_row['id']
@@ -1802,8 +1916,19 @@ elif menu == "Quadro de Movimentação":
             FROM assets a
             INNER JOIN asset_classes c ON c.id = a.class_id
             LEFT JOIN asset_subclasses s ON s.id = a.subclass_id
+            WHERE a.company_id = %s AND a.class_id = %s
+        """ if IS_POSTGRES else """
+            SELECT a.id, a.tag_number, a.description, a.acquisition_date, a.start_date,
+               a.acquisition_cost, a.additional_costs, a.residual_value,
+               a.initial_accum_depr, a.initial_monthly_depr, a.initial_base_date,
+               c.useful_life_years as class_useful_life, c.fiscal_life_years as class_fiscal_life,
+               s.useful_life_years as subclass_useful_life, s.fiscal_life_years as subclass_fiscal_life,
+               a.class_id, a.subclass_id
+            FROM assets a
+            INNER JOIN asset_classes c ON c.id = a.class_id
+            LEFT JOIN asset_subclasses s ON s.id = a.subclass_id
             WHERE a.company_id = ? AND a.class_id = ?
-        """, conn, params=(ACTIVE_COMPANY_ID, c_id))
+        """, conn.conn, params=(ACTIVE_COMPANY_ID, c_id))
 
         if assets_class.empty:
             continue
@@ -1884,9 +2009,15 @@ elif menu == "Auditoria e Compliance (Dedo-Duro)":
         SELECT timestamp as "Data/Hora", user_email as "Usuário", action as "Ação",
                entity as "Módulo/Entidade", details as "Detalhes da Operação"
         FROM audit_logs
+        WHERE company_id = %s
+        ORDER BY id DESC
+    """ if IS_POSTGRES else """
+        SELECT timestamp as "Data/Hora", user_email as "Usuário", action as "Ação",
+               entity as "Módulo/Entidade", details as "Detalhes da Operação"
+        FROM audit_logs
         WHERE company_id = ?
         ORDER BY id DESC
-    """, conn, params=(ACTIVE_COMPANY_ID,))
+    """, conn.conn, params=(ACTIVE_COMPANY_ID,))
     conn.close()
 
     if logs_df.empty:
@@ -1949,11 +2080,11 @@ elif menu == "Tabelas Mestras & Acessos":
                             conn.commit()
                             st.success("Empresa cadastrada!")
                             st.rerun()
-                        except sqlite3.IntegrityError:
+                        except Exception:
                             st.error("Código de empresa já cadastrado.")
 
             st.write("Empresas Cadastradas:")
-            render_table(pd.read_sql_query("SELECT id, code, name, cnpj, depreciation_method FROM companies", conn))
+            render_table(pd.read_sql_query("SELECT id, code, name, cnpj, depreciation_method FROM companies", conn.conn))
 
         # --- 9.2 CLASSES & SUBCLASSES COM UPLOAD ROBUSTO E ILIMITADO (COM UPSERT) ---
         with t_aba2:
@@ -1974,7 +2105,7 @@ elif menu == "Tabelas Mestras & Acessos":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-            up_classes = st.file_uploader("Arquivo de Classes (.xlsx)", type=["xlsx"], key="up_cl_file")
+            up_classes = st.file_uploader("Ficheiro de Classes (.xlsx)", type=["xlsx"], key="up_cl_file")
             if up_classes:
                 try:
                     df_cl = pd.read_excel(up_classes)
@@ -2048,7 +2179,7 @@ elif menu == "Tabelas Mestras & Acessos":
                             conn.commit()
                             st.success("Classe salva!")
                             st.rerun()
-                        except sqlite3.IntegrityError:
+                        except Exception:
                             st.error("Classe já existente.")
 
             render_table(pd.read_sql_query("""
@@ -2058,7 +2189,7 @@ elif menu == "Tabelas Mestras & Acessos":
                 FROM asset_classes c
                 LEFT JOIN asset_subclasses s ON s.class_id = c.id
                 ORDER BY c.name, s.name
-            """, conn))
+            """, conn.conn))
 
         # --- 9.3 PLANO DE CONTAS COM VÍNCULO POR CLASSE ---
         with t_aba3:
@@ -2091,7 +2222,7 @@ elif menu == "Tabelas Mestras & Acessos":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-            up_contas = st.file_uploader("Arquivo do Plano de Contas (.xlsx)", type=["xlsx"], key="up_pc_file")
+            up_contas = st.file_uploader("Ficheiro do Plano de Contas (.xlsx)", type=["xlsx"], key="up_pc_file")
             if up_contas:
                 try:
                     df_pc = pd.read_excel(up_contas)
@@ -2176,9 +2307,18 @@ elif menu == "Tabelas Mestras & Acessos":
                        coa.account_name as "Nome da Conta"
                 FROM chart_of_accounts coa
                 LEFT JOIN asset_classes ac ON ac.id = coa.class_id
+                WHERE coa.company_id = %s
+                ORDER BY coa.account_type, ac.name
+            """ if IS_POSTGRES else """
+                SELECT coa.account_type as "Tipo",
+                       COALESCE(ac.name, '(Geral da Empresa)') as "Classe Vinculada",
+                       coa.account_code as "Código ERP",
+                       coa.account_name as "Nome da Conta"
+                FROM chart_of_accounts coa
+                LEFT JOIN asset_classes ac ON ac.id = coa.class_id
                 WHERE coa.company_id = ?
                 ORDER BY coa.account_type, ac.name
-            """, conn, params=(ACTIVE_COMPANY_ID,)))
+            """, conn.conn, params=(ACTIVE_COMPANY_ID,)))
 
         # --- 9.4 USUÁRIOS & PERMISSÕES ---
         with t_aba4:
@@ -2196,7 +2336,7 @@ elif menu == "Tabelas Mestras & Acessos":
                             conn.commit()
                             st.success(f"Usuário {u_email} cadastrado com senha temporária 'trocar123'.")
                             st.rerun()
-                        except sqlite3.IntegrityError:
+                        except Exception:
                             st.error("E-mail já existente.")
 
             st.write("Vincular Usuário Externo a Empresas:")
@@ -2220,7 +2360,7 @@ elif menu == "Tabelas Mestras & Acessos":
 
             render_table(pd.read_sql_query("""
                 SELECT id, email, user_type, must_reset_password, created_at FROM users
-            """, conn))
+            """, conn.conn))
 
         # --- 9.5 MANUTENÇÃO & AJUSTES ---
         with t_aba5:
